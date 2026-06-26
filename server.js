@@ -65,7 +65,7 @@ app.post('/create-checkout-session', async (req, res) => {
 // Le front-end appelle cette route au retour de Stripe (avec ?session_id=...)
 // pour savoir s'il peut activer le VIP. La vérification se fait ICI, côté serveur,
 // jamais dans le navigateur (sinon n'importe qui pourrait tricher).
-app.get('/verify-payment', async (req, res) => {
+app.get('/verify-session', async (req, res) => {
     try {
           const { session_id } = req.query;
           if (!session_id) return res.status(400).json({ error: 'session_id manquant' });
