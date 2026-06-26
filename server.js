@@ -15,7 +15,7 @@ const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
 
 // Mets ici l'adresse de ton site une fois en ligne (ex: https://mtlchat.com)
 // Pendant les tests, tu peux laisser "*" mais il faudra le restreindre en production.
-app.use(cors({ origin: process.env.FRONTEND_URL || '*' }));
+app.use(cors({ origin: '*' }));
 app.use(express.json());
 
 // ---------- Route racine (health check pour Render) ----------
