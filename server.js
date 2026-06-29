@@ -1,113 +1,196 @@
-// server.js — Backend de paiement pour MTL Chat (Stripe)
-// ---------------------------------------------------------
+// server.js — Backend MTL Chat
+// ------------------------------------------------------------------
 // Ce serveur fait 2 choses :
-// 1. Crée une session de paiement Stripe quand un visiteur clique "Payer"
-// 2. Vérifie auprès de Stripe (avec ta clé secrète) que le paiement est bien confirmé
-//    avant de dire au site "active le VIP" — jamais le navigateur seul ne décide ça.
+// 1) Paiements Stripe (VIP)
+// 2) Mise en relation video aleatoire entre utilisateurs via Socket.IO
+//    + relais de la signalisation WebRTC (offer / answer / ICE).
+// ------------------------------------------------------------------
 
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
+const http = require('http');
+const { Server } = require('socket.io');
 const Stripe = require('stripe');
 
 const app = express();
 const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
 
-// Mets ici l'adresse de ton site une fois en ligne (ex: https://mtlchat.com)
-// Pendant les tests, tu peux laisser "*" mais il faudra le restreindre en production.
+// Origines autorisees (mets ton domaine en prod, ou laisse '*' pour tester)
+const ALLOWED_ORIGIN = process.env.FRONTEND_URL || '*';
 app.use(cors({ origin: '*' }));
+
+// IMPORTANT: le webhook Stripe a besoin du corps brut (raw), donc on le
+// declare AVANT express.json() et on applique json() sur le reste.
+app.post('/webhook', express.raw({ type: 'application/json' }), (req, res) => {
+    const sig = req.headers['stripe-signature'];
+    let event;
+    try {
+        event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
+    } catch (err) {
+        console.error('Webhook signature error:', err.message);
+        return res.status(400).send('Webhook Error: ' + err.message);
+    }
+    if (event.type === 'checkout.session.completed') {
+        const session = event.data.object;
+        console.log('Paiement confirme pour le plan:', session.metadata && session.metadata.plan);
+    }
+    res.json({ received: true });
+});
+
 app.use(express.json());
 
-// ---------- Route racine (health check pour Render) ----------
+// Health check (Render)
 app.get('/', (req, res) => {
     res.json({ status: 'ok', message: 'MTL Chat Backend is running' });
 });
 
-// ---------- Définition des 3 plans VIP (doit correspondre à mtl-chat.html) ----------
+// Les 3 plans VIP (doivent correspondre au frontend)
 const PLANS = {
-    '1d': { label: '1 jour',   amountCents: 1199, days: 1  },
-    '7d': { label: '7 jours',  amountCents: 3499, days: 7  },
-    '1m': { label: '1 mois',   amountCents: 5999, days: 30 }
+    '1d': { label: '1 jour',  amountCents: 1199, days: 1 },
+    '7d': { label: '7 jours', amountCents: 3499, days: 7 },
+    '1m': { label: '1 mois',  amountCents: 5999, days: 30 }
 };
 
-// ---------- 1) Créer une session de paiement Stripe ----------
-// Le front-end appelle cette route quand l'utilisateur clique "Payer"
+// Cree une session de paiement Stripe
 app.post('/create-checkout-session', async (req, res) => {
     try {
-          const { plan } = req.body;
-          const planInfo = PLANS[plan];
-          if (!planInfo) return res.status(400).json({ error: 'Plan invalide' });
-
-      const session = await stripe.checkout.sessions.create({
-              mode: 'payment',
-              payment_method_types: ['card'],
-              line_items: [{
-                        price_data: {
-                                    currency: 'cad',
-                                    product_data: { name: `MTL Chat VIP — ${planInfo.label}` },
-                                    unit_amount: planInfo.amountCents
-                        },
-                        quantity: 1
-              }],
-              metadata: { plan }, // on garde le plan choisi pour le retrouver après paiement
-              success_url: `${process.env.FRONTEND_URL}/?session_id={CHECKOUT_SESSION_ID}&vip=success`,
-              cancel_url:  `${process.env.FRONTEND_URL}/?vip=cancel`
-      });
-
-      res.json({ url: session.url });
+        const { planKey } = req.body;
+        const plan = PLANS[planKey];
+        if (!plan) return res.status(400).json({ error: 'Plan invalide' });
+        const frontend = process.env.FRONTEND_URL || ALLOWED_ORIGIN;
+        const session = await stripe.checkout.sessions.create({
+            mode: 'payment',
+            line_items: [{
+                price_data: {
+                    currency: 'cad',
+                    product_data: { name: 'MTL Chat VIP - ' + plan.label },
+                    unit_amount: plan.amountCents
+                },
+                quantity: 1
+            }],
+            metadata: { plan: planKey },
+            success_url: frontend + '/?session_id={CHECKOUT_SESSION_ID}',
+            cancel_url: frontend + '/'
+        });
+        res.json({ url: session.url, id: session.id });
     } catch (err) {
-          console.error(err);
-          res.status(500).json({ error: 'Impossible de créer la session de paiement' });
+        console.error('create-checkout-session error:', err.message);
+        res.status(500).json({ error: err.message });
     }
 });
 
-// ---------- 2) Vérifier qu'un paiement a vraiment été payé ----------
-// Le front-end appelle cette route au retour de Stripe (avec ?session_id=...)
-// pour savoir s'il peut activer le VIP. La vérification se fait ICI, côté serveur,
-// jamais dans le navigateur (sinon n'importe qui pourrait tricher).
+// Verifie aupres de Stripe qu'un paiement est bien confirme
 app.get('/verify-session', async (req, res) => {
     try {
-          const { session_id } = req.query;
-          if (!session_id) return res.status(400).json({ error: 'session_id manquant' });
-
-      const session = await stripe.checkout.sessions.retrieve(session_id);
-
-      if (session.payment_status === 'paid') {
-              const plan = session.metadata.plan;
-              const planInfo = PLANS[plan];
-              const days = planInfo ? planInfo.days : 1;
-              const expiresAt = Date.now() + days * 24 * 60 * 60 * 1000;
-              res.json({ paid: true, plan, expiresAt });
-      } else {
-              res.json({ paid: false });
-      }
+        const { session_id } = req.query;
+        if (!session_id) return res.status(400).json({ error: 'session_id manquant' });
+        const session = await stripe.checkout.sessions.retrieve(session_id);
+        if (session.payment_status === 'paid') {
+            const planKey = session.metadata && session.metadata.plan;
+            const plan = PLANS[planKey];
+            return res.json({ paid: true, plan: planKey, days: plan ? plan.days : 0 });
+        }
+        res.json({ paid: false });
     } catch (err) {
-          console.error(err);
-          res.status(500).json({ error: 'Impossible de vérifier le paiement' });
+        console.error('verify-session error:', err.message);
+        res.status(500).json({ error: err.message });
     }
 });
 
-// ---------- 3) Webhook Stripe (optionnel mais recommandé) ----------
-app.post('/webhook', express.raw({ type: 'application/json' }), (req, res) => {
-    const sig = req.headers['stripe-signature'];
-    let event;
-
-           try {
-                 event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
-           } catch (err) {
-                 console.error('Signature webhook invalide:', err.message);
-                 return res.sendStatus(400);
-           }
-
-           if (event.type === 'checkout.session.completed') {
-                 const session = event.data.object;
-                 console.log(`✅ Paiement confirmé pour le plan: ${session.metadata.plan}`);
-                 // Ici, dans une vraie version, tu mettrais à jour une base de données
-      // (ex: marquer l'utilisateur comme VIP jusqu'à telle date).
-           }
-
-           res.json({ received: true });
+// ==================================================================
+//  SERVEUR DE MISE EN RELATION (Socket.IO)  --  c'est ce qui manquait
+// ==================================================================
+const server = http.createServer(app);
+const io = new Server(server, {
+    cors: { origin: '*', methods: ['GET', 'POST'] }
 });
 
-const PORT = process.env.PORT || 4242;
-app.listen(PORT, () => console.log(`✅ Serveur MTL Chat backend démarré sur le port ${PORT}`));
+// File d'attente des joueurs cherchant un partenaire
+let waiting = [];               // sockets en attente
+const partnerOf = {};           // socket.id -> partner socket.id
+const profileOf = {};           // socket.id -> profil envoye par le client
+
+function broadcastCount() {
+    io.emit('online-count', io.engine.clientsCount);
+}
+
+function leaveQueue(socket) {
+    waiting = waiting.filter(s => s.id !== socket.id);
+}
+
+function breakPair(socket, notify) {
+    const partnerId = partnerOf[socket.id];
+    if (partnerId) {
+        delete partnerOf[partnerId];
+        delete partnerOf[socket.id];
+        if (notify) {
+            const partnerSock = io.sockets.sockets.get(partnerId);
+            if (partnerSock) partnerSock.emit('partner-left');
+        }
+    }
+}
+
+function tryMatch(socket) {
+    // retire d'eventuels doublons puis cherche un autre en attente
+    leaveQueue(socket);
+    const other = waiting.find(s => s.id !== socket.id && s.connected);
+    if (other) {
+        leaveQueue(other);
+        partnerOf[socket.id] = other.id;
+        partnerOf[other.id] = socket.id;
+        // l'un des deux est designe 'initiateur' de l'offre WebRTC
+        socket.emit('matched', { initiator: true,  partnerProfile: profileOf[other.id]  || {} });
+        other.emit('matched',  { initiator: false, partnerProfile: profileOf[socket.id] || {} });
+    } else {
+        waiting.push(socket);
+    }
+}
+
+io.on('connection', (socket) => {
+    broadcastCount();
+
+    // Le client cherche un partenaire (envoie son profil)
+    socket.on('find-partner', (profile) => {
+        profileOf[socket.id] = profile || {};
+        breakPair(socket, true); // si deja en appel, on coupe l'ancien
+        tryMatch(socket);
+    });
+
+    // Relais de la signalisation WebRTC vers le partenaire
+    socket.on('signal', (data) => {
+        const partnerId = partnerOf[socket.id];
+        if (partnerId) {
+            const partnerSock = io.sockets.sockets.get(partnerId);
+            if (partnerSock) partnerSock.emit('signal', data);
+        }
+    });
+
+    // Messages de chat texte pendant l'appel
+    socket.on('chat-message', (msg) => {
+        const partnerId = partnerOf[socket.id];
+        if (partnerId) {
+            const partnerSock = io.sockets.sockets.get(partnerId);
+            if (partnerSock) partnerSock.emit('chat-message', msg);
+        }
+    });
+
+    // L'utilisateur quitte l'appel courant
+    socket.on('leave-room', () => {
+        breakPair(socket, true);
+        leaveQueue(socket);
+    });
+
+    // Deconnexion
+    socket.on('disconnect', () => {
+        breakPair(socket, true);
+        leaveQueue(socket);
+        delete profileOf[socket.id];
+        broadcastCount();
+    });
+});
+
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => {
+    console.log('MTL Chat Backend (Stripe + Socket.IO) en ecoute sur le port ' + PORT);
+});
