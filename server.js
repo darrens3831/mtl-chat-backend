@@ -46,30 +46,45 @@ const PLANS = {
 };
 
 app.post('/create-checkout-session', async (req, res) => {
-    try {
-        const { planKey } = req.body;
-        const plan = PLANS[planKey];
-        if (!plan) return res.status(400).json({ error: 'Plan invalide' });
-        const frontend = process.env.FRONTEND_URL || ALLOWED_ORIGIN;
-        const session = await stripe.checkout.sessions.create({
-            mode: 'payment',
-            line_items: [{
-                price_data: {
-                    currency: 'cad',
-                    product_data: { name: 'MTL Chat VIP - ' + plan.label },
-                    unit_amount: plan.amountCents
-                },
-                quantity: 1
-            }],
-            metadata: { plan: planKey },
-            success_url: frontend + '/?session_id={CHECKOUT_SESSION_ID}',
-            cancel_url: frontend + '/'
-        });
-        res.json({ url: session.url, id: session.id });
-    } catch (err) {
-        console.error('create-checkout-session error:', err.message);
-        res.status(500).json({ error: err.message });
+  try {
+    const planKey = req.body.plan;
+    const uiMode = req.body.uiMode === 'embedded' ? 'embedded' : 'hosted';
+    const plan = PLANS[planKey];
+    if (!plan) return res.status(400).json({ error: 'Plan invalide' });
+
+    const frontend = process.env.FRONTEND_URL || ALLOWED_ORIGIN;
+
+    const params = {
+      mode: 'payment',
+      ui_mode: uiMode,
+      line_items: [{
+        price_data: {
+          currency: 'cad',
+          product_data: { name: 'MTL Chat VIP - ' + plan.label },
+          unit_amount: plan.amountCents
+        },
+        quantity: 1
+      }],
+      metadata: { plan: planKey }
+    };
+
+    if (uiMode === 'embedded') {
+      params.return_url = frontend + '/?session_id={CHECKOUT_SESSION_ID}';
+    } else {
+      params.success_url = frontend + '/?session_id={CHECKOUT_SESSION_ID}';
+      params.cancel_url = frontend + '/?vip=cancel';
     }
+
+    const session = await stripe.checkout.sessions.create(params);
+
+    if (uiMode === 'embedded') {
+      return res.json({ clientSecret: session.client_secret });
+    }
+    return res.json({ url: session.url, id: session.id });
+  } catch (err) {
+    console.error('create-checkout-session error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 app.get('/verify-session', async (req, res) => {
