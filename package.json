@@ -1,15 +1,16 @@
 {
   "name": "mtl-chat-backend",
   "version": "1.0.0",
-  "description": "Backend Stripe pour MTL Chat - gère les paiements VIP",
+  "description": "Backend MTL Chat : paiements Stripe + mise en relation Socket.IO",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
-    "express": "^4.19.2",
-    "stripe": "^16.2.0",
     "cors": "^2.8.5",
-    "dotenv": "^16.4.5"
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "socket.io": "^4.7.5",
+    "stripe": "^16.2.0"
   }
 }
