@@ -1,9 +1,7 @@
 // server.js — Backend MTL Chat
 // ------------------------------------------------------------------
-// Ce serveur fait 2 choses :
 // 1) Paiements Stripe (VIP)
-// 2) Mise en relation video aleatoire entre utilisateurs via Socket.IO
-//    + relais de la signalisation WebRTC (offer / answer / ICE).
+// 2) Mise en relation video aleatoire via Socket.IO + relais WebRTC.
 // ------------------------------------------------------------------
 
 require('dotenv').config();
@@ -16,12 +14,9 @@ const Stripe = require('stripe');
 const app = express();
 const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
 
-// Origines autorisees (mets ton domaine en prod, ou laisse '*' pour tester)
 const ALLOWED_ORIGIN = process.env.FRONTEND_URL || '*';
 app.use(cors({ origin: '*' }));
 
-// IMPORTANT: le webhook Stripe a besoin du corps brut (raw), donc on le
-// declare AVANT express.json() et on applique json() sur le reste.
 app.post('/webhook', express.raw({ type: 'application/json' }), (req, res) => {
     const sig = req.headers['stripe-signature'];
     let event;
@@ -40,19 +35,16 @@ app.post('/webhook', express.raw({ type: 'application/json' }), (req, res) => {
 
 app.use(express.json());
 
-// Health check (Render)
 app.get('/', (req, res) => {
     res.json({ status: 'ok', message: 'MTL Chat Backend is running' });
 });
 
-// Les 3 plans VIP (doivent correspondre au frontend)
 const PLANS = {
     '1d': { label: '1 jour',  amountCents: 1199, days: 1 },
     '7d': { label: '7 jours', amountCents: 3499, days: 7 },
     '1m': { label: '1 mois',  amountCents: 5999, days: 30 }
 };
 
-// Cree une session de paiement Stripe
 app.post('/create-checkout-session', async (req, res) => {
     try {
         const { planKey } = req.body;
@@ -80,7 +72,6 @@ app.post('/create-checkout-session', async (req, res) => {
     }
 });
 
-// Verifie aupres de Stripe qu'un paiement est bien confirme
 app.get('/verify-session', async (req, res) => {
     try {
         const { session_id } = req.query;
@@ -98,26 +89,16 @@ app.get('/verify-session', async (req, res) => {
     }
 });
 
-// ==================================================================
-//  SERVEUR DE MISE EN RELATION (Socket.IO)  --  c'est ce qui manquait
-// ==================================================================
+// ============== Socket.IO : mise en relation + relais WebRTC ==============
 const server = http.createServer(app);
-const io = new Server(server, {
-    cors: { origin: '*', methods: ['GET', 'POST'] }
-});
+const io = new Server(server, { cors: { origin: '*', methods: ['GET', 'POST'] } });
 
-// File d'attente des joueurs cherchant un partenaire
-let waiting = [];               // sockets en attente
-const partnerOf = {};           // socket.id -> partner socket.id
-const profileOf = {};           // socket.id -> profil envoye par le client
+let waiting = [];
+const partnerOf = {};
+const profileOf = {};
 
-function broadcastCount() {
-    io.emit('online-count', io.engine.clientsCount);
-}
-
-function leaveQueue(socket) {
-    waiting = waiting.filter(s => s.id !== socket.id);
-}
+function broadcastCount() { io.emit('online-count', io.engine.clientsCount); }
+function leaveQueue(socket) { waiting = waiting.filter(s => s.id !== socket.id); }
 
 function breakPair(socket, notify) {
     const partnerId = partnerOf[socket.id];
@@ -132,14 +113,12 @@ function breakPair(socket, notify) {
 }
 
 function tryMatch(socket) {
-    // retire d'eventuels doublons puis cherche un autre en attente
     leaveQueue(socket);
     const other = waiting.find(s => s.id !== socket.id && s.connected);
     if (other) {
         leaveQueue(other);
         partnerOf[socket.id] = other.id;
         partnerOf[other.id] = socket.id;
-        // l'un des deux est designe 'initiateur' de l'offre WebRTC
         socket.emit('matched', { initiator: true,  partnerProfile: profileOf[other.id]  || {} });
         other.emit('matched',  { initiator: false, partnerProfile: profileOf[socket.id] || {} });
     } else {
@@ -150,23 +129,24 @@ function tryMatch(socket) {
 io.on('connection', (socket) => {
     broadcastCount();
 
-    // Le client cherche un partenaire (envoie son profil)
     socket.on('find-partner', (profile) => {
         profileOf[socket.id] = profile || {};
-        breakPair(socket, true); // si deja en appel, on coupe l'ancien
+        breakPair(socket, true);
         tryMatch(socket);
     });
 
-    // Relais de la signalisation WebRTC vers le partenaire
+    // Le frontend envoie { signal: { type, sdp/candidate } }. On transmet au
+    // partenaire l'objet interne 'signal' non emballe, car son handler lit
+    // directement signal.type / signal.sdp / signal.candidate.
     socket.on('signal', (data) => {
         const partnerId = partnerOf[socket.id];
-        if (partnerId) {
-            const partnerSock = io.sockets.sockets.get(partnerId);
-            if (partnerSock) partnerSock.emit('signal', data);
-        }
+        if (!partnerId) return;
+        const partnerSock = io.sockets.sockets.get(partnerId);
+        if (!partnerSock) return;
+        const payload = (data && data.signal !== undefined) ? data.signal : data;
+        partnerSock.emit('signal', payload);
     });
 
-    // Messages de chat texte pendant l'appel
     socket.on('chat-message', (msg) => {
         const partnerId = partnerOf[socket.id];
         if (partnerId) {
@@ -175,13 +155,8 @@ io.on('connection', (socket) => {
         }
     });
 
-    // L'utilisateur quitte l'appel courant
-    socket.on('leave-room', () => {
-        breakPair(socket, true);
-        leaveQueue(socket);
-    });
+    socket.on('leave-room', () => { breakPair(socket, true); leaveQueue(socket); });
 
-    // Deconnexion
     socket.on('disconnect', () => {
         breakPair(socket, true);
         leaveQueue(socket);
