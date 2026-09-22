@@ -39,6 +39,28 @@ app.get('/', (req, res) => {
     res.json({ status: 'ok', message: 'MTL Chat Backend is running' });
 });
 
+app.get('/ice-servers', async (req, res) => {
+    try {
+        const keyId = process.env.CF_TURN_KEY_ID;
+        const apiToken = process.env.CF_TURN_API_TOKEN;
+        if (!keyId || !apiToken) throw new Error('Cloudflare TURN non configure');
+        const r = await fetch(`https://rtc.live.cloudflare.com/v1/turn/keys/${keyId}/credentials/generate-ice-servers`, {
+            method: 'POST',
+            headers: { 'Authorization': `Bearer ${apiToken}`, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ ttl: 86400 })
+        });
+        if (!r.ok) throw new Error('Erreur Cloudflare ' + r.status);
+        const data = await r.json();
+        res.json(data.iceServers);
+    } catch (err) {
+        console.error('ice-servers error:', err.message);
+        res.json([
+            { urls: 'stun:stun.l.google.com:19302' },
+            { urls: 'stun:stun1.l.google.com:19302' }
+            ]);
+    }
+});
+
 const PLANS = {
     '1d': { label: '1 jour',  amountCents: 1199, days: 1 },
     '7d': { label: '7 jours', amountCents: 3499, days: 7 },
