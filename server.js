@@ -10,6 +10,7 @@ const cors = require('cors');
 const http = require('http');
 const { Server } = require('socket.io');
 const Stripe = require('stripe');
+const crypto = require('crypto');
 
 const app = express();
 const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
@@ -60,6 +61,29 @@ app.get('/ice-servers', async (req, res) => {
             ]);
     }
 });
+
+// ============== Jeton VIP signé (le statut VIP est décidé par le serveur) ==============
+// Clé de signature : VIP_TOKEN_SECRET si défini, sinon dérivée de la clé Stripe secrète.
+const VIP_SECRET = process.env.VIP_TOKEN_SECRET ||
+    crypto.createHash('sha256').update('mtlchat-vip:' + (process.env.STRIPE_SECRET_KEY || '')).digest('hex');
+
+function b64url(buf) { return Buffer.from(buf).toString('base64').replace(/=+$/, '').replace(/\+/g, '-').replace(/\//g, '_'); }
+function signVipToken(payload) {
+    const body = b64url(JSON.stringify(payload));
+    const sig = b64url(crypto.createHmac('sha256', VIP_SECRET).update(body).digest());
+    return body + '.' + sig;
+}
+// Retourne la date d'expiration (ms) si le jeton est valide et non expiré, sinon 0.
+function vipExpiryFromToken(token) {
+    try {
+        if (typeof token !== 'string' || token.indexOf('.') < 0) return 0;
+        const [body, sig] = token.split('.');
+        const expected = b64url(crypto.createHmac('sha256', VIP_SECRET).update(body).digest());
+        if (!sig || sig.length !== expected.length || !crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected))) return 0;
+        const data = JSON.parse(Buffer.from(body.replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString());
+        return (data.exp && data.exp > Date.now()) ? data.exp : 0;
+    } catch (e) { return 0; }
+}
 
 const PLANS = {
     '1d': { label: '1 jour',  amountCents: 1199, days: 1 },
@@ -117,13 +141,23 @@ app.get('/verify-session', async (req, res) => {
         if (session.payment_status === 'paid') {
             const planKey = session.metadata && session.metadata.plan;
             const plan = PLANS[planKey];
-            return res.json({ paid: true, plan: planKey, days: plan ? plan.days : 0 });
+            if (!plan) return res.json({ paid: false });
+            // L'expiration part de la date du paiement : réutiliser le même session_id ne prolonge rien.
+            const expiresAt = session.created * 1000 + plan.days * 24 * 60 * 60 * 1000;
+            const token = signVipToken({ sid: session.id, plan: planKey, exp: expiresAt });
+            return res.json({ paid: true, plan: planKey, days: plan.days, expiresAt, token, active: expiresAt > Date.now() });
         }
         res.json({ paid: false });
     } catch (err) {
         console.error('verify-session error:', err.message);
         res.status(500).json({ error: err.message });
     }
+});
+
+// Vérifie un jeton VIP stocké côté navigateur.
+app.post('/vip-status', (req, res) => {
+    const exp = vipExpiryFromToken(req.body && req.body.token);
+    res.json({ vip: exp > 0, expiresAt: exp });
 });
 
 // ============== Socket.IO : mise en relation + relais WebRTC ==============
@@ -149,9 +183,19 @@ function breakPair(socket, notify) {
     }
 }
 
+// Le filtre de genre (F / M) est réservé aux VIP ; 'random' accepte tout le monde.
+function accepts(a, b) {
+    const f = a.filter || 'random';
+    return f === 'random' || f === b.gender;
+}
+function compatible(sa, sb) {
+    const a = profileOf[sa.id] || {}, b = profileOf[sb.id] || {};
+    return accepts(a, b) && accepts(b, a);
+}
+
 function tryMatch(socket) {
     leaveQueue(socket);
-    const other = waiting.find(s => s.id !== socket.id && s.connected);
+    const other = waiting.find(s => s.id !== socket.id && s.connected && !partnerOf[s.id] && compatible(socket, s));
     if (other) {
         leaveQueue(other);
         partnerOf[socket.id] = other.id;
@@ -167,7 +211,12 @@ io.on('connection', (socket) => {
     broadcastCount();
 
     socket.on('find-partner', (profile) => {
-        profileOf[socket.id] = profile || {};
+        const p = Object.assign({}, profile || {});
+        const isVip = vipExpiryFromToken(p.vipToken) > 0;
+        delete p.vipToken; // ne jamais transmettre le jeton au partenaire
+        p.gender = p.gender === 'F' ? 'F' : 'M';
+        if (!isVip || (p.filter !== 'F' && p.filter !== 'M')) p.filter = 'random';
+        profileOf[socket.id] = p;
         breakPair(socket, true);
         tryMatch(socket);
     });
