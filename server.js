@@ -226,6 +226,8 @@ const NAME_MAX_CHARS = 30;
 const LOCATION_MAX_CHARS = 60;
 const PHOTO_MAX_CHARS = 700000; // ~500 Ko d'image ; au-delà, le partenaire voit l'initiale
 const PHOTO_RE = /^data:image\/(?:jpeg|jpg|png|webp|gif);base64,[A-Za-z0-9+/]+={0,2}$/;
+// Connexion Google : la photo est un lien vers les serveurs d'images de Google.
+const GOOGLE_PHOTO_RE = /^https:\/\/lh[0-9]+\.googleusercontent\.com\/[A-Za-z0-9_\-\/=.~%]+$/;
 
 function cleanText(v, max, fallback) {
     if (typeof v !== 'string') return fallback;
@@ -233,7 +235,9 @@ function cleanText(v, max, fallback) {
     return s || fallback;
 }
 function cleanPhoto(v) {
-    return (typeof v === 'string' && v.length <= PHOTO_MAX_CHARS && PHOTO_RE.test(v)) ? v : null;
+    if (typeof v !== 'string') return null;
+    if (v.length <= 2000 && GOOGLE_PHOTO_RE.test(v)) return v;
+    return (v.length <= PHOTO_MAX_CHARS && PHOTO_RE.test(v)) ? v : null;
 }
 function publicProfile(raw, isVip) {
     const p = (raw && typeof raw === 'object') ? raw : {};
