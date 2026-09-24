@@ -15,7 +15,9 @@ const crypto = require('crypto');
 const app = express();
 const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
 
-const ALLOWED_ORIGIN = process.env.FRONTEND_URL || '*';
+// Adresse du site (retour après paiement Stripe). Sans « / » final.
+// Si la variable n'est pas définie sur Render, on utilise le domaine du site.
+const FRONTEND_URL = (process.env.FRONTEND_URL || 'https://mtlchats.com').trim().replace(/\/+$/, '');
 app.use(cors({ origin: '*' }));
 
 app.post('/webhook', express.raw({ type: 'application/json' }), (req, res) => {
@@ -63,23 +65,31 @@ app.get('/ice-servers', async (req, res) => {
 });
 
 // ============== Jeton VIP signé (le statut VIP est décidé par le serveur) ==============
-// Clé de signature : VIP_TOKEN_SECRET si défini, sinon dérivée de la clé Stripe secrète.
-const VIP_SECRET = process.env.VIP_TOKEN_SECRET ||
-    crypto.createHash('sha256').update('mtlchat-vip:' + (process.env.STRIPE_SECRET_KEY || '')).digest('hex');
+// Clé de signature : VIP_TOKEN_SECRET (à définir sur Render). Les nouveaux jetons sont signés
+// avec elle. L'ancienne clé (dérivée de la clé Stripe) reste acceptée en lecture pour que
+// les VIP déjà payés ne perdent pas leur accès au moment où tu ajoutes VIP_TOKEN_SECRET.
+const LEGACY_VIP_SECRET = crypto.createHash('sha256')
+    .update('mtlchat-vip:' + (process.env.STRIPE_SECRET_KEY || '')).digest('hex');
+const VIP_SECRET = process.env.VIP_TOKEN_SECRET || LEGACY_VIP_SECRET;
+const VIP_VERIFY_SECRETS = Array.from(new Set([VIP_SECRET, LEGACY_VIP_SECRET]));
+if (!process.env.VIP_TOKEN_SECRET) console.warn('VIP_TOKEN_SECRET non defini : cle derivee de STRIPE_SECRET_KEY utilisee.');
 
 function b64url(buf) { return Buffer.from(buf).toString('base64').replace(/=+$/, '').replace(/\+/g, '-').replace(/\//g, '_'); }
+function hmac(secret, body) { return b64url(crypto.createHmac('sha256', secret).update(body).digest()); }
 function signVipToken(payload) {
     const body = b64url(JSON.stringify(payload));
-    const sig = b64url(crypto.createHmac('sha256', VIP_SECRET).update(body).digest());
-    return body + '.' + sig;
+    return body + '.' + hmac(VIP_SECRET, body);
+}
+function sigMatches(sig, expected) {
+    return sig.length === expected.length && crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected));
 }
 // Retourne la date d'expiration (ms) si le jeton est valide et non expiré, sinon 0.
 function vipExpiryFromToken(token) {
     try {
         if (typeof token !== 'string' || token.indexOf('.') < 0) return 0;
         const [body, sig] = token.split('.');
-        const expected = b64url(crypto.createHmac('sha256', VIP_SECRET).update(body).digest());
-        if (!sig || sig.length !== expected.length || !crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected))) return 0;
+        if (!body || !sig) return 0;
+        if (!VIP_VERIFY_SECRETS.some((s) => sigMatches(sig, hmac(s, body)))) return 0;
         const data = JSON.parse(Buffer.from(body.replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString());
         return (data.exp && data.exp > Date.now()) ? data.exp : 0;
     } catch (e) { return 0; }
@@ -98,7 +108,7 @@ app.post('/create-checkout-session', async (req, res) => {
     const plan = PLANS[planKey];
     if (!plan) return res.status(400).json({ error: 'Plan invalide' });
 
-    const frontend = process.env.FRONTEND_URL || ALLOWED_ORIGIN;
+    const frontend = FRONTEND_URL;
 
     const params = {
       mode: 'payment',
@@ -172,7 +182,10 @@ const io = new Server(server, {
     // Détecte un téléphone verrouillé / un réseau coupé en ~20 s (au lieu de ~45 s par défaut)
     // pour ne pas laisser quelqu'un jumelé avec un « fantôme ».
     pingInterval: 10000,
-    pingTimeout: 10000
+    pingTimeout: 10000,
+    // Le profil envoyé à « Commencer » contient la photo (image en base64). Avec la limite par
+    // défaut de Socket.IO (1 Mo), une photo de téléphone faisait couper la connexion.
+    maxHttpBufferSize: 6e6
 });
 
 // Après « Suivant » (ou un départ), on évite de remettre les deux mêmes personnes ensemble
@@ -204,6 +217,35 @@ function normFilter(f) {
     if (['f', 'femme', 'femmes', 'fille', 'filles', 'female', 'woman', 'women'].includes(v)) return 'F';
     if (['m', 'h', 'homme', 'hommes', 'gars', 'male', 'man', 'men'].includes(v)) return 'M';
     return 'random';
+}
+
+// Profil public transmis au partenaire : seulement les champs affichés par le site, nettoyés.
+// Le site insère le nom, la ville et la photo dans la page (innerHTML) : on retire les
+// caractères qui permettraient d'y injecter du code, et on n'accepte qu'une vraie image.
+const NAME_MAX_CHARS = 30;
+const LOCATION_MAX_CHARS = 60;
+const PHOTO_MAX_CHARS = 700000; // ~500 Ko d'image ; au-delà, le partenaire voit l'initiale
+const PHOTO_RE = /^data:image\/(?:jpeg|jpg|png|webp|gif);base64,[A-Za-z0-9+/]+={0,2}$/;
+
+function cleanText(v, max, fallback) {
+    if (typeof v !== 'string') return fallback;
+    const s = v.replace(/[\u0000-\u001f\u007f<>"'`\\]/g, '').replace(/\s+/g, ' ').trim().slice(0, max);
+    return s || fallback;
+}
+function cleanPhoto(v) {
+    return (typeof v === 'string' && v.length <= PHOTO_MAX_CHARS && PHOTO_RE.test(v)) ? v : null;
+}
+function publicProfile(raw, isVip) {
+    const p = (raw && typeof raw === 'object') ? raw : {};
+    const country = String(p.country || '').trim().toUpperCase();
+    return {
+        gender: normGender(p.gender),
+        filter: isVip ? normFilter(p.filter) : 'random',
+        name: cleanText(p.name, NAME_MAX_CHARS, 'Anonyme'),
+        location: cleanText(p.location, LOCATION_MAX_CHARS, 'Montréal, QC'),
+        country: /^[A-Z]{2}$/.test(country) ? country : 'CA',
+        photo: cleanPhoto(p.photo)
+    };
 }
 
 // Le filtre de genre (F / M) est réservé aux VIP ; 'random' accepte tout le monde.
@@ -310,12 +352,9 @@ io.on('connection', (socket) => {
 
     // Commencer ou « Suivant »
     on('find-partner', (profile) => {
-        const p = (profile && typeof profile === 'object') ? Object.assign({}, profile) : {};
-        const isVip = vipExpiryFromToken(p.vipToken) > 0;
-        delete p.vipToken; // ne jamais transmettre le jeton au partenaire
-        p.gender = normGender(p.gender);
-        p.filter = isVip ? normFilter(p.filter) : 'random';
-        profileOf.set(socket.id, p);
+        const isVip = vipExpiryFromToken(profile && profile.vipToken) > 0;
+        // Seuls les champs publics nettoyés sont gardés (jamais le jeton VIP ni autre chose).
+        profileOf.set(socket.id, publicProfile(profile, isVip));
         breakPair(socket, true); // libère l'ancien partenaire (il reçoit 'partner-left')
         tryMatch(socket);
     });
