@@ -161,92 +161,191 @@ app.post('/vip-status', (req, res) => {
 });
 
 // ============== Socket.IO : mise en relation + relais WebRTC ==============
+// Protocole (identique à avant pour le frontend) :
+//   client -> serveur : 'find-partner' (profil)  -> commencer / « Suivant »
+//                       'signal' { signal, matchId? }, 'chat-message', 'leave-room'
+//   serveur -> client : 'matched' { initiator, partnerProfile, matchId }, 'signal',
+//                       'partner-left', 'chat-message', 'online-count'
 const server = http.createServer(app);
-const io = new Server(server, { cors: { origin: '*', methods: ['GET', 'POST'] } });
+const io = new Server(server, {
+    cors: { origin: '*', methods: ['GET', 'POST'] },
+    // Détecte un téléphone verrouillé / un réseau coupé en ~20 s (au lieu de ~45 s par défaut)
+    // pour ne pas laisser quelqu'un jumelé avec un « fantôme ».
+    pingInterval: 10000,
+    pingTimeout: 10000
+});
 
-let waiting = [];
-const partnerOf = {};
-const profileOf = {};
+// Après « Suivant » (ou un départ), on évite de remettre les deux mêmes personnes ensemble
+// pendant ce délai. S'il n'y a vraiment personne d'autre, ils se retrouvent après ce délai.
+// Réglable sur Render avec la variable REMATCH_COOLDOWN_MS (en millisecondes).
+const REMATCH_COOLDOWN_MS = Number(process.env.REMATCH_COOLDOWN_MS) || 10000;
+const SWEEP_INTERVAL_MS = 1000;
+const CHAT_MAX_CHARS = 500;
 
-function broadcastCount() { io.emit('online-count', io.engine.clientsCount); }
-function leaveQueue(socket) { waiting = waiting.filter(s => s.id !== socket.id); }
+const waiting = new Map();     // socket.id -> socket (ordre d'insertion = ordre d'arrivée dans la file)
+const partnerOf = new Map();   // socket.id -> socket.id du partenaire
+const matchIdOf = new Map();   // socket.id -> identifiant de la mise en relation en cours
+const profileOf = new Map();   // socket.id -> profil public (jamais le jeton VIP)
+const recentPairs = new Map(); // "idA|idB" -> date (ms) avant laquelle on ne les remet pas ensemble
 
-function breakPair(socket, notify) {
-    const partnerId = partnerOf[socket.id];
-    if (partnerId) {
-        delete partnerOf[partnerId];
-        delete partnerOf[socket.id];
-        if (notify) {
-            const partnerSock = io.sockets.sockets.get(partnerId);
-            if (partnerSock) partnerSock.emit('partner-left');
-        }
-    }
+function pairKey(a, b) { return a < b ? a + '|' + b : b + '|' + a; }
+function inCooldown(a, b) {
+    const until = recentPairs.get(pairKey(a, b));
+    return !!until && until > Date.now();
+}
+
+// Accepte 'F'/'M' comme avant, plus les variantes françaises ('femme', 'homme', 'H'...).
+function normGender(g) {
+    const v = String(g || '').trim().toLowerCase();
+    return ['f', 'femme', 'femmes', 'fille', 'female', 'woman'].includes(v) ? 'F' : 'M';
+}
+function normFilter(f) {
+    const v = String(f || '').trim().toLowerCase();
+    if (['f', 'femme', 'femmes', 'fille', 'filles', 'female', 'woman', 'women'].includes(v)) return 'F';
+    if (['m', 'h', 'homme', 'hommes', 'gars', 'male', 'man', 'men'].includes(v)) return 'M';
+    return 'random';
 }
 
 // Le filtre de genre (F / M) est réservé aux VIP ; 'random' accepte tout le monde.
-function accepts(a, b) {
-    const f = a.filter || 'random';
-    return f === 'random' || f === b.gender;
+function accepts(a, b) { return a.filter === 'random' || a.filter === b.gender; }
+function compatible(idA, idB) {
+    const a = profileOf.get(idA), b = profileOf.get(idB);
+    return !!a && !!b && accepts(a, b) && accepts(b, a);
 }
-function compatible(sa, sb) {
-    const a = profileOf[sa.id] || {}, b = profileOf[sb.id] || {};
-    return accepts(a, b) && accepts(b, a);
+function canPair(a, b) {
+    return a.id !== b.id && a.connected && b.connected &&
+        !partnerOf.has(a.id) && !partnerOf.has(b.id) &&
+        compatible(a.id, b.id) && !inCooldown(a.id, b.id);
 }
 
+function pair(initiator, other) {
+    waiting.delete(initiator.id);
+    waiting.delete(other.id);
+    const matchId = crypto.randomBytes(8).toString('hex');
+    partnerOf.set(initiator.id, other.id);
+    partnerOf.set(other.id, initiator.id);
+    matchIdOf.set(initiator.id, matchId);
+    matchIdOf.set(other.id, matchId);
+    // Un seul initiateur : c'est lui qui crée l'offre WebRTC.
+    initiator.emit('matched', { initiator: true, partnerProfile: profileOf.get(other.id) || {}, matchId });
+    other.emit('matched', { initiator: false, partnerProfile: profileOf.get(initiator.id) || {}, matchId });
+}
+
+// Cherche un partenaire dans la file (le plus ancien compatible d'abord), sinon met en attente.
 function tryMatch(socket) {
-    leaveQueue(socket);
-    const other = waiting.find(s => s.id !== socket.id && s.connected && !partnerOf[s.id] && compatible(socket, s));
-    if (other) {
-        leaveQueue(other);
-        partnerOf[socket.id] = other.id;
-        partnerOf[other.id] = socket.id;
-        socket.emit('matched', { initiator: true,  partnerProfile: profileOf[other.id]  || {} });
-        other.emit('matched',  { initiator: false, partnerProfile: profileOf[socket.id] || {} });
-    } else {
-        waiting.push(socket);
+    if (!socket.connected || partnerOf.has(socket.id)) return;
+    for (const other of waiting.values()) {
+        if (canPair(socket, other)) { pair(socket, other); return; }
+    }
+    // S'il attendait déjà (double clic, changement de filtre), il garde sa place.
+    if (!waiting.has(socket.id)) waiting.set(socket.id, socket);
+}
+
+function leaveQueue(socket) { waiting.delete(socket.id); }
+
+function breakPair(socket, notify) {
+    const partnerId = partnerOf.get(socket.id);
+    if (!partnerId) return;
+    partnerOf.delete(socket.id);
+    partnerOf.delete(partnerId);
+    matchIdOf.delete(socket.id);
+    matchIdOf.delete(partnerId);
+    recentPairs.set(pairKey(socket.id, partnerId), Date.now() + REMATCH_COOLDOWN_MS);
+    if (notify) {
+        const partnerSock = io.sockets.sockets.get(partnerId);
+        if (partnerSock) partnerSock.emit('partner-left');
     }
 }
 
+// Filet de sécurité : toutes les secondes, on jumelle les personnes en attente qui peuvent
+// l'être (ex. fin du délai anti-retour) et on nettoie les entrées périmées.
+function sweep() {
+    const now = Date.now();
+    for (const [key, until] of recentPairs) if (until <= now) recentPairs.delete(key);
+    for (const [id, s] of waiting) if (!s.connected || partnerOf.has(id)) waiting.delete(id);
+    if (waiting.size < 2) return;
+    const list = Array.from(waiting.values());
+    for (let i = 0; i < list.length; i++) {
+        const a = list[i];
+        if (!waiting.has(a.id)) continue;
+        for (let j = i + 1; j < list.length; j++) {
+            const b = list[j];
+            if (waiting.has(b.id) && canPair(a, b)) { pair(b, a); break; }
+        }
+    }
+}
+setInterval(() => { try { sweep(); } catch (e) { console.error('sweep error:', e); } }, SWEEP_INTERVAL_MS).unref();
+
+// Nombre de personnes en ligne : regroupé (max 2 fois/s) pour ne pas inonder tout le monde.
+let countTimer = null;
+function broadcastCount() {
+    if (countTimer) return;
+    countTimer = setTimeout(() => { countTimer = null; io.emit('online-count', io.engine.clientsCount); }, 500);
+}
+
+function clampChat(msg) {
+    if (typeof msg === 'string') return msg.slice(0, CHAT_MAX_CHARS);
+    if (msg && typeof msg === 'object') {
+        const m = Object.assign({}, msg);
+        if (typeof m.text === 'string') m.text = m.text.slice(0, CHAT_MAX_CHARS);
+        if (typeof m.message === 'string') m.message = m.message.slice(0, CHAT_MAX_CHARS);
+        return m;
+    }
+    return msg;
+}
+
+// Petit état de santé pour vérifier le serveur : /stats
+app.get('/stats', (req, res) => {
+    res.json({ online: io.engine.clientsCount, waiting: waiting.size, pairs: partnerOf.size / 2 });
+});
+
 io.on('connection', (socket) => {
+    // Une erreur dans un gestionnaire ne doit jamais faire tomber le serveur pour tout le monde.
+    const on = (ev, fn) => socket.on(ev, (...args) => {
+        try { fn(...args); } catch (e) { console.error(ev + ' error:', e); }
+    });
+
+    socket.emit('online-count', io.engine.clientsCount);
     broadcastCount();
 
-    socket.on('find-partner', (profile) => {
-        const p = Object.assign({}, profile || {});
+    // Commencer ou « Suivant »
+    on('find-partner', (profile) => {
+        const p = (profile && typeof profile === 'object') ? Object.assign({}, profile) : {};
         const isVip = vipExpiryFromToken(p.vipToken) > 0;
         delete p.vipToken; // ne jamais transmettre le jeton au partenaire
-        p.gender = p.gender === 'F' ? 'F' : 'M';
-        if (!isVip || (p.filter !== 'F' && p.filter !== 'M')) p.filter = 'random';
-        profileOf[socket.id] = p;
-        breakPair(socket, true);
+        p.gender = normGender(p.gender);
+        p.filter = isVip ? normFilter(p.filter) : 'random';
+        profileOf.set(socket.id, p);
+        breakPair(socket, true); // libère l'ancien partenaire (il reçoit 'partner-left')
         tryMatch(socket);
     });
 
-    // Le frontend envoie { signal: { type, sdp/candidate } }. On transmet au
-    // partenaire l'objet interne 'signal' non emballe, car son handler lit
-    // directement signal.type / signal.sdp / signal.candidate.
-    socket.on('signal', (data) => {
-        const partnerId = partnerOf[socket.id];
+    // Le frontend envoie { signal: { type, sdp/candidate } } (+ matchId facultatif). On transmet
+    // au partenaire l'objet 'signal' déballé, car son handler lit signal.type / .sdp / .candidate.
+    on('signal', (data) => {
+        const partnerId = partnerOf.get(socket.id);
         if (!partnerId) return;
+        // Signal d'une ancienne connexion (après « Suivant ») : on l'ignore.
+        if (data && data.matchId && data.matchId !== matchIdOf.get(socket.id)) return;
         const partnerSock = io.sockets.sockets.get(partnerId);
         if (!partnerSock) return;
         const payload = (data && data.signal !== undefined) ? data.signal : data;
         partnerSock.emit('signal', payload);
     });
 
-    socket.on('chat-message', (msg) => {
-        const partnerId = partnerOf[socket.id];
-        if (partnerId) {
-            const partnerSock = io.sockets.sockets.get(partnerId);
-            if (partnerSock) partnerSock.emit('chat-message', msg);
-        }
+    on('chat-message', (msg) => {
+        const partnerId = partnerOf.get(socket.id);
+        if (!partnerId) return;
+        const partnerSock = io.sockets.sockets.get(partnerId);
+        if (partnerSock) partnerSock.emit('chat-message', clampChat(msg));
     });
 
-    socket.on('leave-room', () => { breakPair(socket, true); leaveQueue(socket); });
+    on('leave-room', () => { breakPair(socket, true); leaveQueue(socket); });
 
     socket.on('disconnect', () => {
         breakPair(socket, true);
         leaveQueue(socket);
-        delete profileOf[socket.id];
+        profileOf.delete(socket.id);
         broadcastCount();
     });
 });
