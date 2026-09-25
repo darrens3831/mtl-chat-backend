@@ -248,7 +248,9 @@ function publicProfile(raw, isVip) {
         name: cleanText(p.name, NAME_MAX_CHARS, 'Anonyme'),
         location: cleanText(p.location, LOCATION_MAX_CHARS, 'Montréal, QC'),
         country: /^[A-Z]{2}$/.test(country) ? country : 'CA',
-        photo: cleanPhoto(p.photo)
+        photo: cleanPhoto(p.photo),
+        // Décidé par le serveur (jeton VIP vérifié) : sert au badge VIP vu par le partenaire.
+        vip: !!isVip
     };
 }
 
@@ -277,10 +279,19 @@ function pair(initiator, other) {
     other.emit('matched', { initiator: false, partnerProfile: profileOf.get(initiator.id) || {}, matchId });
 }
 
-// Cherche un partenaire dans la file (le plus ancien compatible d'abord), sinon met en attente.
+// File d'attente prioritaire : les VIP en attente passent avant les autres
+// (dans chaque groupe, le plus ancien d'abord).
+function isVipSocket(id) { const p = profileOf.get(id); return !!(p && p.vip); }
+function waitingByPriority() {
+    const vips = [], others = [];
+    for (const s of waiting.values()) (isVipSocket(s.id) ? vips : others).push(s);
+    return vips.concat(others);
+}
+
+// Cherche un partenaire dans la file (VIP d'abord, puis le plus ancien compatible), sinon met en attente.
 function tryMatch(socket) {
     if (!socket.connected || partnerOf.has(socket.id)) return;
-    for (const other of waiting.values()) {
+    for (const other of waitingByPriority()) {
         if (canPair(socket, other)) { pair(socket, other); return; }
     }
     // S'il attendait déjà (double clic, changement de filtre), il garde sa place.
@@ -310,7 +321,7 @@ function sweep() {
     for (const [key, until] of recentPairs) if (until <= now) recentPairs.delete(key);
     for (const [id, s] of waiting) if (!s.connected || partnerOf.has(id)) waiting.delete(id);
     if (waiting.size < 2) return;
-    const list = Array.from(waiting.values());
+    const list = waitingByPriority();
     for (let i = 0; i < list.length; i++) {
         const a = list[i];
         if (!waiting.has(a.id)) continue;
