@@ -95,6 +95,105 @@ function vipExpiryFromToken(token) {
     } catch (e) { return 0; }
 }
 
+// ============== Compte utilisateur (connexion Google vérifiée par le serveur) ==============
+// Le site envoie le jeton Google reçu à la connexion ; le serveur vérifie la signature de Google
+// et renvoie un « jeton utilisateur » signé par nous. Il sert à compter les appels gratuits par
+// compte (et non plus seulement dans le navigateur, où il suffisait d'effacer les données du site).
+const GOOGLE_CLIENT_ID = (process.env.GOOGLE_CLIENT_ID ||
+    '387638692815-9va74n4tj0ic7rr51ej7nh7u96fcujk2.apps.googleusercontent.com').trim();
+const GOOGLE_ISSUERS = ['accounts.google.com', 'https://accounts.google.com'];
+const GOOGLE_CERTS_URL = 'https://www.googleapis.com/oauth2/v3/certs';
+let googleKeys = { at: 0, keys: {} };
+
+function b64urlDecode(s) { return Buffer.from(String(s).replace(/-/g, '+').replace(/_/g, '/'), 'base64'); }
+async function googlePublicKey(kid) {
+    const fresh = Date.now() - googleKeys.at < 60 * 60 * 1000;
+    if (!fresh || !googleKeys.keys[kid]) {
+        const r = await fetch(GOOGLE_CERTS_URL);
+        if (!r.ok) throw new Error('certificats Google indisponibles (' + r.status + ')');
+        const data = await r.json();
+        const keys = {};
+        for (const jwk of (data.keys || [])) keys[jwk.kid] = crypto.createPublicKey({ key: jwk, format: 'jwk' });
+        googleKeys = { at: Date.now(), keys };
+    }
+    return googleKeys.keys[kid] || null;
+}
+// Vérifie un jeton de connexion Google (signature, application, émetteur, expiration).
+async function verifyGoogleCredential(credential) {
+    if (typeof credential !== 'string' || credential.length > 5000) throw new Error('jeton absent');
+    const parts = credential.split('.');
+    if (parts.length !== 3) throw new Error('jeton mal formé');
+    const header = JSON.parse(b64urlDecode(parts[0]).toString());
+    const payload = JSON.parse(b64urlDecode(parts[1]).toString());
+    if (header.alg !== 'RS256' || !header.kid) throw new Error('algorithme inattendu');
+    const key = await googlePublicKey(header.kid);
+    if (!key) throw new Error('clé Google inconnue');
+    const ok = crypto.verify('RSA-SHA256', Buffer.from(parts[0] + '.' + parts[1]), key, b64urlDecode(parts[2]));
+    if (!ok) throw new Error('signature invalide');
+    if (payload.aud !== GOOGLE_CLIENT_ID) throw new Error('mauvaise application');
+    if (!GOOGLE_ISSUERS.includes(payload.iss)) throw new Error('mauvais émetteur');
+    if (!payload.exp || payload.exp * 1000 < Date.now() - 60000) throw new Error('jeton expiré');
+    if (!payload.sub) throw new Error('compte absent');
+    return payload;
+}
+function signUserToken(uid) { return signVipToken({ t: 'user', uid, iat: Date.now() }); }
+// Retourne l'identifiant du compte si le jeton utilisateur est valide, sinon ''.
+function userIdFromToken(token) {
+    try {
+        if (typeof token !== 'string' || token.length > 2000 || token.indexOf('.') < 0) return '';
+        const [body, sig] = token.split('.');
+        if (!body || !sig) return '';
+        if (!VIP_VERIFY_SECRETS.some((s) => sigMatches(sig, hmac(s, body)))) return '';
+        const data = JSON.parse(b64urlDecode(body).toString());
+        return (data.t === 'user' && typeof data.uid === 'string') ? data.uid : '';
+    } catch (e) { return ''; }
+}
+
+app.post('/auth/google', async (req, res) => {
+    try {
+        const payload = await verifyGoogleCredential(req.body && req.body.credential);
+        res.json({ userToken: signUserToken('g:' + payload.sub) });
+    } catch (err) {
+        console.warn('auth/google refuse :', err.message);
+        res.status(401).json({ error: 'Connexion Google non valide' });
+    }
+});
+
+// ============== Limite d'appels gratuits (par compte, par jour à l'heure de Montréal) ==============
+// Compté par le serveur à chaque mise en relation ; les VIP sont illimités. Sans compte vérifié
+// (anciens comptes), on compte par adresse IP. Gardé en mémoire : remis à zéro si le serveur redémarre.
+const FREE_CALL_LIMIT = Number(process.env.FREE_CALL_LIMIT) || 300;
+const callsByDay = new Map(); // 'AAAA-MM-JJ' -> Map(clé du compte -> nombre d'appels)
+const dayFormatter = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Toronto', year: 'numeric', month: '2-digit', day: '2-digit' });
+function montrealDay() { return dayFormatter.format(new Date()); }
+function callsToday() {
+    const day = montrealDay();
+    if (!callsByDay.has(day)) {
+        for (const d of callsByDay.keys()) if (d !== day) callsByDay.delete(d); // on oublie les jours passés
+        callsByDay.set(day, new Map());
+    }
+    return callsByDay.get(day);
+}
+function callsUsed(key) { return key ? (callsToday().get(key) || 0) : 0; }
+function addCall(key) { if (key) { const m = callsToday(); m.set(key, (m.get(key) || 0) + 1); } }
+function clientIp(headers, fallback) {
+    const fwd = String((headers && headers['x-forwarded-for']) || '').split(',')[0].trim();
+    return fwd || fallback || '';
+}
+function callKey(userToken, ip) {
+    const uid = userIdFromToken(userToken);
+    return uid ? 'u:' + uid : (ip ? 'ip:' + ip : '');
+}
+
+// Compteur affiché sur la page d'accueil.
+app.post('/calls-status', (req, res) => {
+    const body = req.body || {};
+    const vip = vipExpiryFromToken(body.vipToken) > 0;
+    const key = callKey(body.userToken, clientIp(req.headers, req.socket && req.socket.remoteAddress));
+    const used = callsUsed(key);
+    res.json({ vip, used, limit: FREE_CALL_LIMIT, left: vip ? null : Math.max(0, FREE_CALL_LIMIT - used) });
+});
+
 const PLANS = {
     '1d': { label: '1 jour',  amountCents: 1199, days: 1 },
     '7d': { label: '7 jours', amountCents: 3499, days: 7 },
@@ -174,8 +273,8 @@ app.post('/vip-status', (req, res) => {
 // Protocole (identique à avant pour le frontend) :
 //   client -> serveur : 'find-partner' (profil)  -> commencer / « Suivant »
 //                       'signal' { signal, matchId? }, 'chat-message', 'leave-room'
-//   serveur -> client : 'matched' { initiator, partnerProfile, matchId }, 'signal',
-//                       'partner-left', 'chat-message', 'online-count'
+//   serveur -> client : 'matched' { initiator, partnerProfile, matchId, callsUsed, callsLimit }, 'signal',
+//                       'partner-left', 'chat-message', 'online-count', 'limit-reached' { used, limit }
 const server = http.createServer(app);
 const io = new Server(server, {
     cors: { origin: '*', methods: ['GET', 'POST'] },
@@ -199,6 +298,7 @@ const waiting = new Map();     // socket.id -> socket (ordre d'insertion = ordre
 const partnerOf = new Map();   // socket.id -> socket.id du partenaire
 const matchIdOf = new Map();   // socket.id -> identifiant de la mise en relation en cours
 const profileOf = new Map();   // socket.id -> profil public (jamais le jeton VIP)
+const callKeyOf = new Map();   // socket.id -> clé du compte pour la limite d'appels (jamais envoyée au partenaire)
 const recentPairs = new Map(); // "idA|idB" -> date (ms) avant laquelle on ne les remet pas ensemble
 
 function pairKey(a, b) { return a < b ? a + '|' + b : b + '|' + a; }
@@ -274,9 +374,18 @@ function pair(initiator, other) {
     partnerOf.set(other.id, initiator.id);
     matchIdOf.set(initiator.id, matchId);
     matchIdOf.set(other.id, matchId);
+    // Chaque mise en relation compte pour un appel (sauf VIP).
+    const usage = (s) => {
+        if (isVipSocket(s.id)) return { callsUsed: null, callsLimit: null };
+        addCall(callKeyOf.get(s.id));
+        return { callsUsed: callsUsed(callKeyOf.get(s.id)), callsLimit: FREE_CALL_LIMIT };
+    };
     // Un seul initiateur : c'est lui qui crée l'offre WebRTC.
-    initiator.emit('matched', { initiator: true, partnerProfile: profileOf.get(other.id) || {}, matchId });
-    other.emit('matched', { initiator: false, partnerProfile: profileOf.get(initiator.id) || {}, matchId });
+    initiator.emit('matched', Object.assign({ initiator: true, partnerProfile: profileOf.get(other.id) || {}, matchId }, usage(initiator)));
+    other.emit('matched', Object.assign({ initiator: false, partnerProfile: profileOf.get(initiator.id) || {}, matchId }, usage(other)));
+}
+function limitReached(id) {
+    return !isVipSocket(id) && callsUsed(callKeyOf.get(id)) >= FREE_CALL_LIMIT;
 }
 
 // File d'attente prioritaire : les VIP en attente passent avant les autres
@@ -370,7 +479,14 @@ io.on('connection', (socket) => {
         const isVip = vipExpiryFromToken(profile && profile.vipToken) > 0;
         // Seuls les champs publics nettoyés sont gardés (jamais le jeton VIP ni autre chose).
         profileOf.set(socket.id, publicProfile(profile, isVip));
+        callKeyOf.set(socket.id, callKey(profile && profile.userToken, clientIp(socket.handshake.headers, socket.handshake.address)));
         breakPair(socket, true); // libère l'ancien partenaire (il reçoit 'partner-left')
+        // Limite d'appels gratuits atteinte : pas de nouvelle mise en relation.
+        if (limitReached(socket.id)) {
+            leaveQueue(socket);
+            socket.emit('limit-reached', { used: callsUsed(callKeyOf.get(socket.id)), limit: FREE_CALL_LIMIT });
+            return;
+        }
         tryMatch(socket);
     });
 
@@ -400,6 +516,7 @@ io.on('connection', (socket) => {
         breakPair(socket, true);
         leaveQueue(socket);
         profileOf.delete(socket.id);
+        callKeyOf.delete(socket.id);
         broadcastCount();
     });
 });
